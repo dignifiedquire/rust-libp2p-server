@@ -9,7 +9,7 @@ use libp2p::kad;
 use libp2p::metrics::{Metrics, Recorder};
 use libp2p::noise;
 use libp2p::swarm::{SwarmBuilder, SwarmEvent};
-use libp2p::tcp::{GenTcpConfig, TcpTransport};
+use libp2p::tcp::{GenTcpConfig, TokioTcpTransport};
 use libp2p::Transport;
 use libp2p::{identity, PeerId};
 use log::{debug, info};
@@ -50,7 +50,8 @@ struct Opt {
     enable_autonat: bool,
 }
 
-fn main() -> Result<(), Box<dyn Error>> {
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn Error>> {
     env_logger::init();
 
     let opt = Opt::from_args();
@@ -79,8 +80,8 @@ fn main() -> Result<(), Box<dyn Error>> {
     };
     println!("Local peer id: {:?}", local_peer_id);
 
-    let transport = TcpTransport::new(GenTcpConfig::new());
-    let transport = block_on(dns::DnsConfig::system(transport)).unwrap();
+    let transport = TokioTcpTransport::new(GenTcpConfig::new());
+    let transport = dns::TokioDnsConfig::system(transport).unwrap();
     let noise_keys = noise::Keypair::<noise::X25519Spec>::new()
         .into_authentic(&local_keypair)
         .expect("Signing libp2p-noise static DH keypair failed.");
@@ -97,7 +98,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     );
     let mut swarm = SwarmBuilder::new(transport, behaviour, local_peer_id)
         .executor(Box::new(|fut| {
-            async_std::task::spawn(fut);
+            tokio::task::spawn(fut);
         }))
         .build();
     swarm.listen_on("/ip4/0.0.0.0/tcp/4001".parse()?)?;
@@ -114,71 +115,69 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     let mut bootstrap_timer = Delay::new(BOOTSTRAP_INTERVAL);
 
-    block_on(async {
-        loop {
-            if let Poll::Ready(()) = futures::poll!(&mut bootstrap_timer) {
-                bootstrap_timer.reset(BOOTSTRAP_INTERVAL);
-                let _ = swarm
-                    .behaviour_mut()
-                    .kademlia
-                    .as_mut()
-                    .map(|k| k.bootstrap());
-            }
+    loop {
+        if let Poll::Ready(()) = futures::poll!(&mut bootstrap_timer) {
+            bootstrap_timer.reset(BOOTSTRAP_INTERVAL);
+            let _ = swarm
+                .behaviour_mut()
+                .kademlia
+                .as_mut()
+                .map(|k| k.bootstrap());
+        }
 
-            match swarm.next().await.expect("Swarm not to terminate.") {
-                SwarmEvent::Behaviour(behaviour::Event::Identify(e)) => {
-                    info!("{:?}", e);
-                    metrics.record(&*e);
+        match swarm.next().await.expect("Swarm not to terminate.") {
+            SwarmEvent::Behaviour(behaviour::Event::Identify(e)) => {
+                info!("{:?}", e);
+                metrics.record(&*e);
 
-                    if let IdentifyEvent::Received {
-                        peer_id,
-                        info:
-                            IdentifyInfo {
-                                listen_addrs,
-                                protocols,
-                                ..
-                            },
-                    } = *e
+                if let IdentifyEvent::Received {
+                    peer_id,
+                    info:
+                        IdentifyInfo {
+                            listen_addrs,
+                            protocols,
+                            ..
+                        },
+                } = *e
+                {
+                    if protocols
+                        .iter()
+                        .any(|p| p.as_bytes() == kad::protocol::DEFAULT_PROTO_NAME)
                     {
-                        if protocols
-                            .iter()
-                            .any(|p| p.as_bytes() == kad::protocol::DEFAULT_PROTO_NAME)
-                        {
-                            for addr in listen_addrs {
-                                swarm
-                                    .behaviour_mut()
-                                    .kademlia
-                                    .as_mut()
-                                    .map(|k| k.add_address(&peer_id, addr));
-                            }
+                        for addr in listen_addrs {
+                            swarm
+                                .behaviour_mut()
+                                .kademlia
+                                .as_mut()
+                                .map(|k| k.add_address(&peer_id, addr));
                         }
                     }
                 }
-                SwarmEvent::Behaviour(behaviour::Event::Ping(e)) => {
-                    debug!("{:?}", e);
-                    metrics.record(&e);
+            }
+            SwarmEvent::Behaviour(behaviour::Event::Ping(e)) => {
+                debug!("{:?}", e);
+                metrics.record(&e);
+            }
+            SwarmEvent::Behaviour(behaviour::Event::Kademlia(e)) => {
+                debug!("{:?}", e);
+                metrics.record(&e);
+            }
+            SwarmEvent::Behaviour(behaviour::Event::Relay(e)) => {
+                info!("{:?}", e);
+                metrics.record(&e)
+            }
+            SwarmEvent::Behaviour(behaviour::Event::Autonat(e)) => {
+                info!("{:?}", e);
+                // TODO: Add metric recording for `NatStatus`.
+                // metrics.record(&e)
+            }
+            e => {
+                if let SwarmEvent::NewListenAddr { address, .. } = &e {
+                    println!("Listening on {:?}", address);
                 }
-                SwarmEvent::Behaviour(behaviour::Event::Kademlia(e)) => {
-                    debug!("{:?}", e);
-                    metrics.record(&e);
-                }
-                SwarmEvent::Behaviour(behaviour::Event::Relay(e)) => {
-                    info!("{:?}", e);
-                    metrics.record(&e)
-                }
-                SwarmEvent::Behaviour(behaviour::Event::Autonat(e)) => {
-                    info!("{:?}", e);
-                    // TODO: Add metric recording for `NatStatus`.
-                    // metrics.record(&e)
-                }
-                e => {
-                    if let SwarmEvent::NewListenAddr { address, .. } = &e {
-                        println!("Listening on {:?}", address);
-                    }
 
-                    metrics.record(&e)
-                }
+                metrics.record(&e)
             }
         }
-    })
+    }
 }
